@@ -1,130 +1,96 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.9;
-
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
-// Uncomment this line to use console.log
-// import "hardhat/console.sol";
+contract Staking {
+  using SafeMath for uint256;
+  IERC20 public stakingToken;
+  IERC20 public rewardToken;
 
-contract StakingReward {
-  IERC20 public immutable stakingToken;
-  IERC20 public immutable rewardsToken;
+  mapping(address => uint256) balanceOf;
 
-  address public owner;
+  mapping(address => uint256) rewardOf;
 
-  // Duration of rewards to be paid out (in seconds)
-  uint public duration;
-  // Timestamp of when the rewards finish
-  uint public finishAt;
-  // Minimum of last updated time and reward finish time
-  uint public updatedAt;
-  // Reward to be paid out per second
-  uint public rewardRate;
-  // Sum of (reward rate * dt * 1e18 / total supply)
-  uint public rewardPerTokenStored;
-  // User address => rewardPerTokenStored
-  mapping(address => uint) public userRewardPerTokenPaid;
-  // User address => rewards to be claimed
-  mapping(address => uint) public rewards;
+  mapping(address => uint256) rewardPerTokenPaid;
 
-  // Total staked
-  uint public totalSupply;
-  // User address => staked amount
-  mapping(address => uint) public balanceOf;
+  uint256 public rewardPerTokenStored;
+  uint256 public lastUpdatedTime;
+  uint256 public rewardRate;
+  uint256 public rewardDuration = 7 days;
+  uint256 public periodFinish;
+  uint256 public totalSupply;
 
   constructor(address _stakingToken, address _rewardToken) {
-    owner = msg.sender;
     stakingToken = IERC20(_stakingToken);
-    rewardsToken = IERC20(_rewardToken);
+    rewardToken = IERC20(_rewardToken);
+
+    lastUpdatedTime = block.timestamp;
   }
 
-  modifier onlyOwner() {
-    require(msg.sender == owner, "not authorized");
+  modifier validAmount(uint256 _amount) {
+    require(_amount > 0, "Amount must be greater than 0!");
     _;
   }
 
   modifier updateReward(address _account) {
-    rewardPerTokenStored = rewardPerToken();
-    updatedAt = lastTimeRewardApplicable();
-
-    if (_account != address(0)) {
-      rewards[_account] = earned(_account);
-      userRewardPerTokenPaid[_account] = rewardPerTokenStored;
-    }
-
+    rewardPerTokenStored = getRewardPerTokenStored();
+    lastUpdatedTime = _min(block.timestamp, periodFinish);
+    rewardOf[_account] = earned(_account);
+    rewardPerTokenPaid[_account] = rewardPerTokenStored;
     _;
   }
 
-  function lastTimeRewardApplicable() public view returns (uint) {
-    return _min(finishAt, block.timestamp);
-  }
-
-  function rewardPerToken() public view returns (uint) {
+  function getRewardPerTokenStored() private view returns (uint256) {
     if (totalSupply == 0) {
       return rewardPerTokenStored;
     }
-
     return
       rewardPerTokenStored +
-      (rewardRate * (lastTimeRewardApplicable() - updatedAt) * 1e18) /
+      ((block.timestamp - lastUpdatedTime) * rewardRate * 1e18) /
       totalSupply;
   }
 
-  function stake(uint _amount) external updateReward(msg.sender) {
-    require(_amount > 0, "amount = 0");
-    stakingToken.transferFrom(msg.sender, address(this), _amount);
-    balanceOf[msg.sender] += _amount;
-    totalSupply += _amount;
-  }
+  function earned(address _account) public view returns (uint256) {
+    uint256 currentRewardPerToken = getRewardPerTokenStored();
+    uint256 pastReward = rewardOf[_account];
 
-  function withdraw(uint _amount) external updateReward(msg.sender) {
-    require(_amount > 0, "amount = 0");
-    balanceOf[msg.sender] -= _amount;
-    totalSupply -= _amount;
-    stakingToken.transfer(msg.sender, _amount);
-  }
-
-  function earned(address _account) public view returns (uint) {
     return
-      ((balanceOf[_account] *
-        (rewardPerToken() - userRewardPerTokenPaid[_account])) / 1e18) +
-      rewards[_account];
+      balanceOf[_account]
+        .mul(currentRewardPerToken - rewardPerTokenPaid[_account])
+        .div(1e18)
+        .add(pastReward);
   }
 
-  function getReward() external updateReward(msg.sender) {
-    uint reward = rewards[msg.sender];
-    if (reward > 0) {
-      rewards[msg.sender] = 0;
-      rewardsToken.transfer(msg.sender, reward);
-    }
-  }
+  function stake(uint256 _amount) external validAmount(_amount) {
+    totalSupply = totalSupply.add(_amount);
+    balanceOf[msg.sender] = balanceOf[msg.sender].add(_amount);
 
-  function setRewardsDuration(uint _duration) external onlyOwner {
-    require(finishAt < block.timestamp, "reward duration not finished");
-    duration = _duration;
-  }
-
-  function notifyRewardAmount(
-    uint _amount
-  ) external onlyOwner updateReward(address(0)) {
-    if (block.timestamp >= finishAt) {
-      rewardRate = _amount / duration;
-    } else {
-      uint remainingRewards = (finishAt - block.timestamp) * rewardRate;
-      rewardRate = (_amount + remainingRewards) / duration;
-    }
-
-    require(rewardRate > 0, "reward rate = 0");
-    require(
-      rewardRate * duration <= rewardsToken.balanceOf(address(this)),
-      "reward amount > balance"
+    bool success = stakingToken.transferFrom(
+      msg.sender,
+      address(this),
+      _amount
     );
 
-    finishAt = block.timestamp + duration;
-    updatedAt = block.timestamp;
+    if (!success) revert("Failed to transfer staked tokens!");
   }
 
-  function _min(uint x, uint y) private pure returns (uint) {
-    return x <= y ? x : y;
+  function claimReward(uint256 _amount) external validAmount(_amount) {
+    require(rewardOf[msg.sender] >= _amount, "Not enough reward tokens!");
+    rewardOf[msg.sender] -= _amount;
+    bool success = rewardToken.transfer(msg.sender, _amount);
+    if (!success) revert("Failed to claim reward!");
+  }
+
+  function withdraw(uint256 _amount) external validAmount(_amount) {
+    require(balanceOf[msg.sender] >= _amount, "Not enough staked tokens!");
+    balanceOf[msg.sender] -= _amount;
+    bool success = stakingToken.transfer(msg.sender, _amount);
+    if (!success) revert("Failed to withdraw tokens!");
+  }
+
+  function _min(uint256 v1, uint256 v2) internal pure returns (uint256) {
+    return v1 > v2 ? v2 : v1;
   }
 }
